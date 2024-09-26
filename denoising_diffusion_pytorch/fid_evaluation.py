@@ -23,7 +23,8 @@ class FIDEvaluation:
     def __init__(
         self,
         batch_size,
-        dl,
+        dl_X,
+        dl_y
         sampler,
         channels=3,
         accelerator=None,
@@ -36,7 +37,8 @@ class FIDEvaluation:
         self.n_samples = num_fid_samples
         self.device = device
         self.channels = channels
-        self.dl = dl
+        self.dl_X = dl_X
+        self.dl_Y = dl_y
         self.sampler = sampler
         self.stats_dir = stats_dir
         self.print_fn = print if accelerator is None else accelerator.print
@@ -72,7 +74,7 @@ class FIDEvaluation:
             )
             for _ in tqdm(range(num_batches)):
                 try:
-                    real_samples = next(self.dl)
+                    real_samples = next(self.dl_X)
                 except StopIteration:
                     break
                 real_samples = real_samples.to(self.device)
