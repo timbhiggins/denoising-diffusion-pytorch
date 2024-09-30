@@ -6,7 +6,7 @@ import numpy as np
 import xarray as xr
 from sklearn.preprocessing import QuantileTransformer
 from functools import lru_cache
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import math
 import copy
 from pathlib import Path
@@ -30,12 +30,13 @@ from accelerate import Accelerator
 from denoising_diffusion_pytorch.attend import Attend
 from denoising_diffusion_pytorch.version import __version__
 import matplotlib.pyplot as plt
-from denoising_diffusion_pytorch.Train import Trainer_ARs, GaussianDiffusion_AR
-from denoising_diffusion_pytorch.Train import transform_sampled_images
+from denoising_diffusion_pytorch.Train1 import Trainer_ARs, GaussianDiffusion_AR
+from denoising_diffusion_pytorch.Train1 import transform_sampled_images
 
 ""
 gpu_id=0
 ""
+
 def set_gpu(gpu_id):
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -52,7 +53,6 @@ else:
     device = torch.device('cpu')
 
 # small helper modules
-ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 model = Unet(
     channels = 1,
@@ -76,13 +76,15 @@ trainer = Trainer_ARs(
     '/glade/derecho/scratch/timothyh/data/diffusion_forecasts/processed/',
     train_batch_size = 32,
     train_lr = 8e-5,
-    train_num_steps = 10000,         # total training steps
+    train_num_steps = 300,         # total training steps
     gradient_accumulate_every = 2,    # gradient accumulation steps
     ema_decay = 0.995,                # exponential moving average decay
     amp = True,                       # turn on mixed precision
     calculate_fid = False,           # whether to calculate fid during training
     max_grad_norm = 1.0,
 )
+ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
+
 trainer.train()
 sampled_images = diffusion.sample(batch_size = 50, return_all_timesteps = False)
 sampled_images_t = transform_sampled_images(sampled_images, trainer)

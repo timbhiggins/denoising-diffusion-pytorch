@@ -78,7 +78,7 @@ class DataProcessed(Dataset):
         data_t = (data_t - self.minivt) / (self.maxivt - self.minivt)
         return data_t
 
-    def _augment_data(self, data, datay):
+    def _augment_data(self, data):
         # Apply rotations for augmentation
         data_rot90 = np.rot90(data, k=1, axes=(1, 2))
         data_rot180 = np.rot90(data, k=2, axes=(1, 2))
@@ -86,7 +86,7 @@ class DataProcessed(Dataset):
 
         
         # Concatenate all rotations along the first dimension (time)
-        return np.concatenate([data, data_rot90, data_rot180, data_rot270])
+        return np.concatenate([data, data_rot90, data_rot180, data_rot270],axis=0)
     @lru_cache(maxsize=2)  # Cache up to 5 file loads at once
     def _load_data_from_file(self, file_path):
         with xr.open_dataset(file_path) as ds:
@@ -854,11 +854,6 @@ def divisible_by(numer, denom):
 
 def identity(t, *args, **kwargs):
     return t
-
-def cycle(dl):
-    while True:
-        for data in dl:
-            yield data
 
 def has_int_squareroot(num):
     return (math.sqrt(num) ** 2) == num

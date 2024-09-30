@@ -282,6 +282,8 @@ class Unet(Module):
         dim_mults = (1, 2, 4, 8),
         channels = 3,
         self_condition = False,
+        condition = True,
+        conditional_dimensions = 1,
         learned_variance = False,
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
@@ -299,10 +301,11 @@ class Unet(Module):
 
         self.channels = channels
         self.self_condition = self_condition
+        self.condition = condition
         input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
-        self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
+        self.init_conv = nn.Conv2d(input_channels + conditional_dimensions, init_dim, 7, padding = 3)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
@@ -389,13 +392,14 @@ class Unet(Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond):
+    def forward(self, x, time, x_self_cond = None, x_cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
-
+        if self.condition:
+            x = torch.cat((x, x_cond),dim = 1)
         x = self.init_conv(x)
         r = x.clone()
 
@@ -431,7 +435,22 @@ class Unet(Module):
 
         x = self.final_res_block(x, t)
         return self.final_conv(x)
-
+    from multiprocessing import cpu_count
+    def get_num_cpus():
+        # Check if PBS_NODEFILE exists
+        if 'PBS_NODEFILE' in os.environ:
+            nodefile = os.getenv('PBS_NODEFILE')
+            try:
+            # Use subprocess to count the lines (which correspond to CPUs)
+                num_cpus = int(subprocess.check_output(['wc', '-l', nodefile]).split()[0])
+                return num_cpus
+            except Exception as e:
+                print(f"Error reading PBS_NODEFILE: {e}")
+                return None
+        else:
+            # Fallback to cpu_count if PBS_NODEFILE is not available
+            from multiprocessing import cpu_count
+            return cpu_count()
 # gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
@@ -501,6 +520,7 @@ class GaussianDiffusion(Module):
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
+        self.condition = self.model.condition
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -635,8 +655,8 @@ class GaussianDiffusion(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond = None, x_cond = None, clip_x_start = False, rederive_pred_noise = False):
+        model_output = self.model(x, t, x_self_cond, x_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -660,8 +680,8 @@ class GaussianDiffusion(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, x_self_cond = None, x_cond = None, clip_denoised = True):
+        preds = self.model_predictions(x, t, x_self_cond, x_cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -671,7 +691,7 @@ class GaussianDiffusion(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None):
+    def p_sample(self, x, t: int, x_self_cond = None, x_cond = None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
@@ -680,7 +700,7 @@ class GaussianDiffusion(Module):
         return pred_img, x_start
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
+    def p_sample_loop(self, shape, x_cond, return_all_timesteps = False):
         batch, device = shape[0], self.device
 
         img = torch.randn(shape, device = device)
@@ -699,7 +719,7 @@ class GaussianDiffusion(Module):
         return ret
 
     @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False):
+    def ddim_sample(self, shape, x_cond, return_all_timesteps = False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -714,7 +734,7 @@ class GaussianDiffusion(Module):
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, x_cond, clip_x_start = True, rederive_pred_noise = True)
 
             if time_next < 0:
                 img = x_start
@@ -741,10 +761,10 @@ class GaussianDiffusion(Module):
         return ret
 
     @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
+    def sample(self, x_cond, batch_size = 16, return_all_timesteps = False):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, h, w), x_cond, return_all_timesteps = return_all_timesteps)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -762,7 +782,8 @@ class GaussianDiffusion(Module):
 
         for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, i, self_cond)
+            x_cond = x_cond if self.condition else None
+            img, x_start = self.p_sample(img, i, self_cond, x_cond)
 
         return img
 
@@ -773,7 +794,7 @@ class GaussianDiffusion(Module):
         return torch.from_numpy(assign).to(dist.device)
 
     @autocast('cuda', enabled = False)
-    def q_sample(self, x_start, t, noise = None):
+    def q_sample(self, x_start, t, x_cond, noise = None):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         if self.immiscible:
@@ -785,7 +806,7 @@ class GaussianDiffusion(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
+    def p_losses(self, x_start, t, x_cond, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
 
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -832,13 +853,13 @@ class GaussianDiffusion(Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
+    def forward(self, img, x_cond, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        return self.p_losses(img, t, x_cond, *args, **kwargs)
 
 # dataset classes
 
@@ -942,8 +963,6 @@ class Trainer:
 
         self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
 
-        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
-
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
         dl = self.accelerator.prepare(dl)
@@ -1043,7 +1062,11 @@ class Trainer:
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-
+        x_cond_rand = torch.zeros(60,1,128,128)
+        data, x_c = self.ds.__getitem__(0)
+        x_cond_rand = torch.zeros(60, 1, x_c.shape[1], x_c.shape[2], device=device)
+        num_gpus = accelerator.num_processes
+        
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
@@ -1052,10 +1075,18 @@ class Trainer:
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-
+                    data, x_cond = next(self.dl)
+                    data = data.to(device)
+                    x_cond = x_cond.to(device)
+                    
+                    go_in = torch.randint(0, 100, (1,)).item()  # Index for x_cond_rand
+                    if go_in < 30:
+                        idx_rand1 = torch.randint(0, 59, (1,)).item()  # Index for x_cond_rand
+                        idx_rand2 = torch.randint(0, int(self.batch_size/num_gpus), (1,)).item()  # Index for x_cond
+                        x_cond_rand[idx_rand1, 0, :, :] = x_cond[idx_rand2, 0, :, :].clone()
+                        
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss = self.model(data, x_cond)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
@@ -1081,6 +1112,7 @@ class Trainer:
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
+                            x_cond_rand = x_cond_rand.to(device)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
                         all_images = torch.cat(all_images_list, dim = 0)
