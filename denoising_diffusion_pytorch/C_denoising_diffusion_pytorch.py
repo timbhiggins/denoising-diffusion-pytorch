@@ -3,15 +3,27 @@ import copy
 from pathlib import Path
 from random import random
 from functools import partial
+from functools import lru_cache
+import time 
+import os
+import subprocess
+
+
 from collections import namedtuple
 from multiprocessing import cpu_count
 import glob
+import pickle
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
+import wandb
 
 from torch.optim import Adam
 
@@ -21,7 +33,7 @@ from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 
 from scipy.optimize import linear_sum_assignment
-import xarray as xr
+
 from PIL import Image
 from tqdm.auto import tqdm
 from ema_pytorch import EMA
@@ -37,119 +49,6 @@ from denoising_diffusion_pytorch.version import __version__
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
-def get_config():
-    config = {
-        "input_channels": 1,
-        "output_channels": 1,
-        "context_image": True,
-        "context_channels": 1,
-        "num_blocks": [2, 2],
-        "hidden_channels": 32,
-        "hidden_context_channels": 8,
-        "time_embedding_dim": 256,
-        "image_size": 128,
-        "noise_sampling_coeff": 0.85,
-        "denoise_time": 970,
-        "activation": "gelu",
-        "norm": True,
-        "subsample": 100000,
-        "save_name": "model_weights.pt",
-        "dim_mults": [4, 4],
-        "base_dim": 32,
-        "timesteps": 1000,
-        "pading": "reflect",
-        "scaling": "std",
-        "optimization": {
-            "epochs": 400,
-            "lr": 0.01,
-            "wd": 0.05,
-            "batch_size": 32,
-            "scheduler": True
-        }
-    }
-    return config
-    
-class DataProcessed(Dataset):
-    def __init__(self, file_paths, config, mean = 152.16729736328125, std = 147.735107421875, maxivt = 15.220598, minivt = -1.0300009):
-        """
-        Args:
-            file_paths: List of paths to netCDF files
-            config: Configuration dict with scaling and augmentation options
-        """
-        self.file_paths = file_paths
-        self.config = config
-        self.mean = mean
-        self.std = std
-        self.minivt = minivt
-        self.maxivt = maxivt
-        self.augmentation = config.get('augment', False)
-        self.scaler = None
-        if config['scaling'] == 'quantile':
-            self.scaler = QuantileTransformer()
-
-         # Initialize cache size (you can adjust it depending on memory constraints)
-        self.cache_size = config.get('cache_size', 10)
-        self.cached_data = {}  # Manual cache for storing loaded data
-
-    def __len__(self):
-        # Calculate total number of samples across all files
-        total_len = 0
-        for path in self.file_paths:
-            with xr.open_dataset(path) as ds:
-                total_len += ds.sizes['time']  # Assuming 'time' is the main dimension
-        return total_len
-
-    def _apply_scaling(self, data):
-        if self.config['scaling'] == 'quantile':
-            data_t = self.scaler.fit_transform(data.reshape(-1, 1)).reshape(data.shape)
-        elif self.config['scaling'] == 'std':
-            data_t = (data - self.mean) / self.std
-            self.config['mean'], self.config['std'] = self.mean, self.std
-        else:
-            raise ValueError("Invalid scaling method specified.")
-
-        data_t = (data_t - self.minivt) / (self.maxivt - self.minivt)
-        return data_t
-
-    def _augment_data(self, data):
-        # Apply rotations for augmentation
-        data_rot90 = np.rot90(data, k=1, axes=(1, 2))
-        data_rot180 = np.rot90(data, k=2, axes=(1, 2))
-        data_rot270 = np.rot90(data, k=3, axes=(1, 2))
-
-        
-        # Concatenate all rotations along the first dimension (time)
-        return np.concatenate([data, data_rot90, data_rot180, data_rot270],axis=0)
-    def _load_data_from_file(self, file_path):
-        with xr.open_dataset(file_path) as ds:
-            dataX = ds.forecast.values  # Replace 'forecast' with the relevant key in your dataset
-            datay = ds.analysis.values
-            # Apply scaling
-            dataX = self._apply_scaling(dataX)
-            datay = self._apply_scaling(datay)
-            # Apply augmentation if necessary
-            if self.augmentation:
-                dataX = self._augment_data(dataX)
-                datay = self._augment_data(datay)
-
-        return torch.clamp(torch.tensor(dataX, dtype=torch.float32),min=0,max=1),torch.clamp(torch.tensor(datay, dtype=torch.float32),min=0,max=1)
-
-    def __getitem__(self, idx):
-        """
-        Load data lazily and cache it, based on global index.
-        """
-        # Determine which file and sample this index belongs to
-        cumulative_len = 0
-        for file_idx, path in enumerate(self.file_paths):
-            with xr.open_dataset(path) as ds:
-                file_len = ds.sizes['time']  # Length along the 'time' dimension
-                if cumulative_len + file_len > idx:
-                    sample_idx = idx - cumulative_len
-                    dataX,datay = self._load_data_from_file(path)  # Load data from cache or disk
-                    return dataX[sample_idx],datay[sample_idx]
-                cumulative_len += file_len
-
-        raise IndexError(f"Index {idx} is out of bounds")
 
 def exists(x):
     return x is not None
@@ -212,6 +111,8 @@ def Downsample(dim, dim_out = None):
         Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
         nn.Conv2d(dim * 4, default(dim_out, dim), 1)
     )
+
+
 
 class RMSNorm(Module):
     def __init__(self, dim):
@@ -394,9 +295,9 @@ class Unet(Module):
         out_dim = None,
         dim_mults = (1, 2, 4, 8),
         channels = 3,
+        conditional_dimensions=0,
         self_condition = False,
         condition = True,
-        conditional_dimensions = 1,
         learned_variance = False,
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
@@ -505,15 +406,18 @@ class Unet(Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond = None, x_cond = None):
+    def forward(self, x, time, x_self_cond = None, x_cond=None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
+
         if self.condition:
             x = torch.cat((x, x_cond),dim = 1)
+
         x = self.init_conv(x)
+        
         r = x.clone()
 
         t = self.time_mlp(time)
@@ -548,23 +452,25 @@ class Unet(Module):
 
         x = self.final_res_block(x, t)
         return self.final_conv(x)
-    from multiprocessing import cpu_count
-    def get_num_cpus():
-        # Check if PBS_NODEFILE exists
-        if 'PBS_NODEFILE' in os.environ:
-            nodefile = os.getenv('PBS_NODEFILE')
-            try:
-            # Use subprocess to count the lines (which correspond to CPUs)
-                num_cpus = int(subprocess.check_output(['wc', '-l', nodefile]).split()[0])
-                return num_cpus
-            except Exception as e:
-                print(f"Error reading PBS_NODEFILE: {e}")
-                return None
-        else:
-            # Fallback to cpu_count if PBS_NODEFILE is not available
-            from multiprocessing import cpu_count
-            return cpu_count()
+
 # gaussian diffusion trainer class
+from multiprocessing import cpu_count
+def get_num_cpus():
+    # Check if PBS_NODEFILE exists
+    if 'PBS_NODEFILE' in os.environ:
+        nodefile = os.getenv('PBS_NODEFILE')
+        try:
+            # Use subprocess to count the lines (which correspond to CPUs)
+            num_cpus = int(subprocess.check_output(['wc', '-l', nodefile]).split()[0])
+            return num_cpus
+        except Exception as e:
+            print(f"Error reading PBS_NODEFILE: {e}")
+            return None
+    else:
+        # Fallback to cpu_count if PBS_NODEFILE is not available
+        from multiprocessing import cpu_count
+        return cpu_count()
+
 
 def extract(a, t, x_shape):
     b, *_ = t.shape
@@ -634,6 +540,7 @@ class GaussianDiffusion(Module):
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
         self.condition = self.model.condition
+        
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -768,7 +675,7 @@ class GaussianDiffusion(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_cond, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
+    def model_predictions(self, x, t, x_self_cond = None, x_cond=None, clip_x_start = False, rederive_pred_noise = False):
         model_output = self.model(x, t, x_self_cond, x_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
@@ -804,16 +711,16 @@ class GaussianDiffusion(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None, x_cond = None):
+    def p_sample(self, x, t: int, x_self_cond = None, x_cond=None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, x_cond = x_cond, clip_denoised = True)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, x_cond = x_cond,clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, x_cond, return_all_timesteps = False):
+    def p_sample_loop(self, shape, x_cond,return_all_timesteps = False):
         batch, device = shape[0], self.device
 
         img = torch.randn(shape, device = device)
@@ -823,6 +730,7 @@ class GaussianDiffusion(Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
+            
             img, x_start = self.p_sample(img, t, self_cond, x_cond)
             imgs.append(img)
 
@@ -847,7 +755,7 @@ class GaussianDiffusion(Module):
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, x_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, x_cond, clip_x_start = True, rederive_pred_noise = True)
 
             if time_next < 0:
                 img = x_start
@@ -877,7 +785,7 @@ class GaussianDiffusion(Module):
     def sample(self, x_cond, batch_size = 16, return_all_timesteps = False):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, h, w), x_cond, return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, h, w), x_cond,return_all_timesteps = return_all_timesteps)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -943,8 +851,10 @@ class GaussianDiffusion(Module):
         x_self_cond = None
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t, x_cond).pred_x_start
+                x_self_cond = self.model_predictions(x, t).pred_x_start
                 x_self_cond.detach_()
+
+        ### maybe do the same for the condition: WEC KLUDGE
 
         # predict and take gradient step
 
@@ -972,49 +882,104 @@ class GaussianDiffusion(Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
-        return self.p_losses(img, t, x_cond, *args, **kwargs)
+        return self.p_losses(img, t, x_cond,*args, **kwargs)
 
 # dataset classes
 
-class Dataset(Dataset):
-    def __init__(
-        self,
-        folder,
-        image_size,
-        exts = ['jpg', 'jpeg', 'png', 'tiff'],
-        augment_horizontal_flip = False,
-        convert_image_to = None
-    ):
-        super().__init__()
-        self.folder = folder
-        self.image_size = image_size
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+class DataProcessed(Dataset):
+    def __init__(self, file_paths, config, mean = 152.16729736328125, std = 147.735107421875, maxivt = 15.220598, minivt = -1.0300009):
+        """
+        Args:
+            file_paths: List of paths to netCDF files
+            config: Configuration dict with scaling and augmentation options
+        """
+        self.file_paths = file_paths
+        self.config = config
+        self.mean = mean
+        self.std = std
+        self.minivt = minivt
+        self.maxivt = maxivt
+        self.augmentation = config.get('augment', False)
+        self.scaler = None
+        if config['scaling'] == 'quantile':
+            self.scaler = QuantileTransformer()
 
-        maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
-
-        self.transform = T.Compose([
-            T.Lambda(maybe_convert_fn),
-            T.Resize(image_size),
-            T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
-            T.CenterCrop(image_size),
-            T.ToTensor()
-        ])
+        # Initialize cache size (you can adjust it depending on memory constraints)
+        self.cache_size = config.get('cache_size', 10)
+        self.cached_data = {}  # Manual cache for storing loaded data
 
     def __len__(self):
-        return len(self.paths)
+        # Calculate total number of samples across all files
+        total_len = 0
+        for path in self.file_paths:
+            with xr.open_dataset(path) as ds:
+                total_len += ds.sizes['time']  # Assuming 'time' is the main dimension
+        return total_len
 
-    def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+    def _apply_scaling(self, data):
+        if self.config['scaling'] == 'quantile':
+            data_t = self.scaler.fit_transform(data.reshape(-1, 1)).reshape(data.shape)
+        elif self.config['scaling'] == 'std':
+            data_t = (data - self.mean) / self.std
+            self.config['mean'], self.config['std'] = self.mean, self.std
+        else:
+            raise ValueError("Invalid scaling method specified.")
+
+        data_t = (data_t - self.minivt) / (self.maxivt - self.minivt)
+        return data_t
+
+    def _augment_data(self, data):
+        # Apply rotations for augmentation
+        data_rot90 = np.rot90(data, k=1, axes=(1, 2))
+        data_rot180 = np.rot90(data, k=2, axes=(1, 2))
+        data_rot270 = np.rot90(data, k=3, axes=(1, 2))
+        
+        # Concatenate all rotations along the first dimension (time)
+        return np.concatenate([data, data_rot90, data_rot180, data_rot270], axis=0)
+
+    @lru_cache(maxsize=2)  # Cache up to 5 file loads at once
+    def _load_data_from_file(self, file_path):
+        """
+        Lazy load the data from file and preprocess it.
+        """
+        with xr.open_dataset(file_path) as ds:
+    
+            ds = self._apply_scaling(ds)
+            data = np.swapaxes(ds[['PS','PRECT','TREFHT']].to_array().values,0,1)  # Replace 'forecast' with the relevant key in your dataset
+            cond = np.expand_dims(ds['CLIM_T2M'].values,1)  # Replace 'forecast' with the relevant key in your dataset
+    
+            # Apply augmentation if necessary
+            if self.augmentation:
+                data = self._augment_data(data)
+    
+        return torch.clamp(torch.tensor(data, dtype=torch.float32),min=0, max=1), torch.clamp(torch.tensor(cond, dtype=torch.float32),min=0, max=1)
+
+    def __getitem__(self, idx):
+        """
+        Load data lazily and cache it, based on global index.
+        """
+        # Determine which file and sample this index belongs to
+        cumulative_len = 0
+        for file_idx, path in enumerate(self.file_paths):
+            with xr.open_dataset(path) as ds:
+                file_len = ds.sizes['time']  # Length along the 'time' dimension
+                if cumulative_len + file_len > idx:
+                    sample_idx = idx - cumulative_len
+                    data, cond = self._load_data_from_file(path)  # Load data from cache or disk
+                    return data[sample_idx], cond[sample_idx]
+                cumulative_len += file_len
+
+        raise IndexError(f"Index {idx} is out of bounds")
 
 # trainer class
-        
 class Trainer:
     def __init__(
         self,
         diffusion_model,
         folder,
+        config,
+        run_name,
+        do_wandb, 
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
@@ -1041,13 +1006,21 @@ class Trainer:
 
         # accelerator
 
-        self.accelerator = Accelerator(
-            split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
-        )
-
+        if do_wandb:
+            self.accelerator = Accelerator(
+                split_batches = split_batches,
+                mixed_precision = mixed_precision_type if amp else 'no',
+                log_with = "wandb"
+            )
+        else:
+            self.accelerator = Accelerator(
+                split_batches = split_batches,
+                mixed_precision = mixed_precision_type if amp else 'no'
+            )
+        
         # model
-
+        self.run_name = run_name
+        self.do_wandb = do_wandb
         self.model = diffusion_model
         self.channels = diffusion_model.channels
         is_ddim_sampling = diffusion_model.is_ddim_sampling
@@ -1074,13 +1047,31 @@ class Trainer:
 
         # dataset and dataloader
 
-
         
-        config = get_config()
-        FPs = sorted(glob.glob(f'{folder}*train.nc'))
-        self.ds = DataProcessed(FPs, config)
-        print(self.ds)
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = 10)
+        self.config = config
+        
+
+        FPs = sorted(glob.glob(f'/{folder}/*.nc'))
+        with open('scaling_dict.pkl', 'rb') as file:
+            loaded_mean_std_dict = pickle.load(file)
+        
+        with open('scaling_dict_minmax.pkl', 'rb') as file:
+            loaded_min_max_dict = pickle.load(file)
+        
+        self.ds = DataProcessed(FPs, config, loaded_mean_std_dict, loaded_min_max_dict)
+        
+        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+
+        print('cpu count:', cpu_count())
+
+
+
+        # Check if PBS_NP is set, otherwise fallback to cpu_count()
+        # num_cpus = int(os.getenv('PBS_NP', cpu_count()))
+
+        num_cpus = get_num_cpus()
+
+        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = 64)
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -1141,7 +1132,7 @@ class Trainer:
     def device(self):
         return self.accelerator.device
 
-    def save(self, milestone):
+    def save(self, milestone, run_name):
         if not self.accelerator.is_local_main_process:
             return
 
@@ -1154,13 +1145,13 @@ class Trainer:
             'version': __version__
         }
 
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        torch.save(data, str(self.results_folder / f'{run_name}-{milestone}.pt'))
 
-    def load(self, milestone):
+    def load(self, milestone, run_name):
         accelerator = self.accelerator
         device = accelerator.device
 
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+        data = torch.load(str(self.results_folder / f'{run_name}-{milestone}.pt'), map_location=device)
 
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
@@ -1179,10 +1170,34 @@ class Trainer:
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-        x_cond_rand = torch.zeros(60,1,128,128)
+        
+        self.config["num_params"]=sum(pttt.numel() for pttt in self.model.parameters() if pttt.requires_grad)
+        # Initialize tracker via accelerator
+
+        if self.do_wandb:
+            self.accelerator.init_trackers(project_name="CESM_PS_PRECT_T2m", config=self.config,
+                                           init_kwargs={"wandb":{"name":self.run_name}} )
+    
+            # Add a delay to allow the tracker to initialize properly
+            print("Waiting for 10 seconds to ensure tracker is initialized...")
+            time.sleep(10)
+
+            # Fetch the tracker and check if the run is associated
+            wandb_tracker = self.accelerator.get_tracker("wandb")
+    
+            # Ensure tracker has a run object
+            if hasattr(wandb_tracker, 'run') and wandb_tracker.run:
+                wandb_run = wandb_tracker.run
+                run_name = wandb_run.name if wandb_run.name else "Unnamed run"
+                print(f"Run Name: {run_name}")
+            else:
+                print("Error: The tracker does not have a Wandb run associated.")
+
+        # Store the run name
+
+        x_cond_rand = torch.zeros(60,1,192,288)
         dada, x_c = self.ds.__getitem__(0)
-        dada = dada.to(device).unsqueeze(1)
-        x_c = x_c.to(device).unsqueeze(1)
+        x_cond_rand = torch.zeros(60, 1, x_c.shape[1], x_c.shape[2], device=device)
         num_gpus = accelerator.num_processes
         
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
@@ -1194,15 +1209,16 @@ class Trainer:
 
                 for _ in range(self.gradient_accumulate_every):
                     data, x_cond = next(self.dl)
-                    data = data.to(device).unsqueeze(1)
-                    x_cond = x_cond.to(device).unsqueeze(1)
-                    
+                    data = data.to(device)
+                    x_cond = x_cond.to(device)
+
+                    # Perform a safe in-place update
                     go_in = torch.randint(0, 100, (1,)).item()  # Index for x_cond_rand
                     if go_in < 30:
                         idx_rand1 = torch.randint(0, 59, (1,)).item()  # Index for x_cond_rand
-                        idx_rand2 = torch.randint(0, int(x_cond.shape[0]), (1,)).item()  # Index for x_cond
-                        x_cond_rand[idx_rand1, 0, :, :] = x_cond[idx_rand2, 0, :, :].clone()
-                        
+                        idx_rand2 = torch.randint(0, int(self.batch_size/num_gpus), (1,)).item()  # Index for x_cond
+                        x_cond_rand[idx_rand1, 0, :, :] = x_cond[idx_rand2, 0, :, :].clone()  # Clone to avoid issues with inference mode
+
                     with self.accelerator.autocast():
                         loss = self.model(data, x_cond)
                         loss = loss / self.gradient_accumulate_every
@@ -1211,6 +1227,10 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
+
+                if (self.step%10) == 0:
+                    if self.do_wandb:
+                        self.accelerator.log({'total_loss': total_loss}, step=self.step)
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1236,6 +1256,32 @@ class Trainer:
                         all_images = torch.cat(all_images_list, dim = 0)
 
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        
+                        samples_fig=plt.figure(figsize=(18, 9))
+                        plt.suptitle("Samples after %d epochs" % self.step)
+                        for pp in range(20):
+                            plt.subplot(4, 5, 1 + pp)
+                            plt.axis('off')
+                            plt.imshow(all_images[pp,2,:,:].squeeze(0).data.cpu().numpy(),
+                                    cmap='RdBu', vmin=0, vmax=1)
+                            plt.colorbar()
+                        plt.tight_layout()
+
+                        if self.do_wandb:
+                            self.accelerator.log({"Samples":wandb.Image(samples_fig)})
+
+                        samples_fig=plt.figure(figsize=(18, 9))
+                        plt.suptitle("Conditions after %d epochs" % self.step)
+                        for pp in range(20):
+                            plt.subplot(4, 5, 1 + pp)
+                            plt.axis('off')
+                            plt.imshow(x_cond_rand[pp,0,:,:].squeeze().data.cpu().numpy(),
+                                    cmap='RdBu', vmin=0, vmax=1)
+                            plt.colorbar()
+                        plt.tight_layout()
+                        if self.do_wandb:
+                            self.accelerator.log({"Condition":wandb.Image(samples_fig)})
+                        plt.close()
 
                         # whether to calculate fid
 
@@ -1249,7 +1295,7 @@ class Trainer:
                                 self.save("best")
                             self.save("latest")
                         else:
-                            self.save(milestone)
+                            self.save(milestone, self.run_name)
 
                 pbar.update(1)
 
