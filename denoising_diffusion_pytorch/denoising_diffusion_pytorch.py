@@ -1,35 +1,31 @@
 import math
 import copy
+import wandb
 from pathlib import Path
 from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
+import matplotlib.pyplot as plt
 import glob
 import torch
+import time
 from torch import nn, einsum
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
-
 from torch.optim import Adam
-
 from torchvision import transforms as T, utils
-
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
-
 from scipy.optimize import linear_sum_assignment
 import xarray as xr
 from PIL import Image
 from tqdm.auto import tqdm
 from ema_pytorch import EMA
-
 from accelerate import Accelerator
-
 from denoising_diffusion_pytorch.attend import Attend
-
 from denoising_diffusion_pytorch.version import __version__
 
 # constants
@@ -416,7 +412,7 @@ class Unet(Module):
         self.self_condition = self_condition
         self.condition = condition
         input_channels = channels * (2 if self_condition else 1)
-
+        print(input_channels+conditional_dimensions)
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels + conditional_dimensions, init_dim, 7, padding = 3)
 
@@ -505,7 +501,7 @@ class Unet(Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond = None, x_cond = None):
+    def forward(self, x, time, x_cond = None, x_self_cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
@@ -769,7 +765,7 @@ class GaussianDiffusion(Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_cond, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond, x_cond)
+        model_output = self.model(x, t, x_cond, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -793,8 +789,8 @@ class GaussianDiffusion(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, x_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond, x_cond)
+    def p_mean_variance(self, x, t, x_cond = None, x_self_cond = None, clip_denoised = True):
+        preds = self.model_predictions(x, t, x_cond, x_self_cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -804,10 +800,10 @@ class GaussianDiffusion(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None, x_cond = None):
+    def p_sample(self, x, t: int, x_cond, x_self_cond = None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, x_cond = x_cond, clip_denoised = True)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_cond = x_cond, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
@@ -823,7 +819,7 @@ class GaussianDiffusion(Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond, x_cond)
+            img, x_start = self.p_sample(img, t, x_cond, self_cond)
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -896,7 +892,7 @@ class GaussianDiffusion(Module):
         for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
             self_cond = x_start if self.self_condition else None
             x_cond = x_cond if self.condition else None
-            img, x_start = self.p_sample(img, i, self_cond, x_cond)
+            img, x_start = self.p_sample(img, i, x_cond, self_cond)
 
         return img
 
@@ -948,7 +944,7 @@ class GaussianDiffusion(Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond, x_cond)
+        model_out = self.model(x, t, x_cond, x_self_cond)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -1015,6 +1011,8 @@ class Trainer:
         self,
         diffusion_model,
         folder,
+        run_name,
+        do_wandb,
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
@@ -1024,7 +1022,7 @@ class Trainer:
         ema_update_every = 10,
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
-        save_and_sample_every = 1000,
+        save_and_sample_every = 500,
         num_samples = 25,
         results_folder = './results',
         amp = False,
@@ -1040,14 +1038,21 @@ class Trainer:
         super().__init__()
 
         # accelerator
-
-        self.accelerator = Accelerator(
-            split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
-        )
+        if do_wandb:
+            self.accelerator = Accelerator(
+                split_batches = split_batches,
+                mixed_precision = mixed_precision_type if amp else 'no',
+                log_with = "wandb"
+            )
+        else:
+            self.accelerator = Accelerator(
+                split_batches = split_batches,
+                mixed_precision = mixed_precision_type if amp else 'no'
+            )
 
         # model
-
+        self.run_name = run_name
+        self.do_wandb = do_wandb
         self.model = diffusion_model
         self.channels = diffusion_model.channels
         is_ddim_sampling = diffusion_model.is_ddim_sampling
@@ -1159,7 +1164,7 @@ class Trainer:
     def load(self, milestone):
         accelerator = self.accelerator
         device = accelerator.device
-
+        
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
 
         model = self.accelerator.unwrap_model(self.model)
@@ -1179,7 +1184,26 @@ class Trainer:
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
+        if self.do_wandb:
+            self.accelerator.init_trackers(project_name="Diffusion_AR", config=get_config(),
+                                           init_kwargs={"wandb":{"name":self.run_name}} )
+            # Add a delay to allow the tracker to initialize properly
+            print("Waiting for 10 seconds to ensure tracker is initialized...")
+            time.sleep(10)
+
+            # Fetch the tracker and check if the run is associated
+            wandb_tracker = self.accelerator.get_tracker("wandb")
+    
+            # Ensure tracker has a run object
+            if hasattr(wandb_tracker, 'run') and wandb_tracker.run:
+                wandb_run = wandb_tracker.run
+                run_name = wandb_run.name if wandb_run.name else "Unnamed run"
+                print(f"Run Name: {run_name}")
+            else:
+                print("Error: The tracker does not have a Wandb run associated.")
+                
         x_cond_rand = torch.zeros(60,1,128,128)
+        x_rand = torch.zeros(60,1,128,128)
         dada, x_c = self.ds.__getitem__(0)
         dada = dada.to(device).unsqueeze(1)
         x_c = x_c.to(device).unsqueeze(1)
@@ -1193,7 +1217,7 @@ class Trainer:
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data, x_cond = next(self.dl)
+                    x_cond, data = next(self.dl)
                     data = data.to(device).unsqueeze(1)
                     x_cond = x_cond.to(device).unsqueeze(1)
                     
@@ -1202,7 +1226,7 @@ class Trainer:
                         idx_rand1 = torch.randint(0, 59, (1,)).item()  # Index for x_cond_rand
                         idx_rand2 = torch.randint(0, int(x_cond.shape[0]), (1,)).item()  # Index for x_cond
                         x_cond_rand[idx_rand1, 0, :, :] = x_cond[idx_rand2, 0, :, :].clone()
-                        
+                        x_rand[idx_rand1, 0, :, :] = data[idx_rand2, 0, :, :].clone()
                     with self.accelerator.autocast():
                         loss = self.model(data, x_cond)
                         loss = loss / self.gradient_accumulate_every
@@ -1211,6 +1235,11 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
+                
+                if (self.step%10) == 0:
+                    if self.do_wandb:
+                        self.accelerator.log({'total_loss': total_loss}, step=self.step)
+                        
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1219,37 +1248,44 @@ class Trainer:
                 self.opt.zero_grad()
 
                 accelerator.wait_for_everyone()
-
+                
                 self.step += 1
                 if accelerator.is_main_process:
                     self.ema.update()
 
                     if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
                         self.ema.ema_model.eval()
-
+                        milestone = self.step // self.save_and_sample_every
+                        batches = num_to_groups(self.num_samples, self.batch_size)
+                        x_cond_rand = x_cond_rand.to(device)
+                        all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n, x_cond = x_cond_rand[:n,:,:,:]), batches))
                         with torch.inference_mode():
-                            milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-                            x_cond_rand = x_cond_rand.to(device)
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n, x_cond = x_cond_rand[:n,:,:,:]), batches))
+                            all_images = torch.cat(all_images_list, dim = 0)
+                            utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        self.save(milestone)
+                        samples_fig=plt.figure(figsize=(18, 9))
+                        plt.suptitle("Samples after %d epochs" % self.step)
+                        for pp in range(20):
+                            plt.subplot(4, 5, 1 + pp)
+                            plt.axis('off')
+                            plt.imshow(all_images[pp,0,:,:].squeeze(0).data.cpu().numpy(),
+                                        cmap='RdBu', vmin=0, vmax=1)
+                            plt.colorbar()
+                        plt.tight_layout()
+                        wandb.log({"Samples":wandb.Image(samples_fig)})
+                        plt.close()
 
-                        all_images = torch.cat(all_images_list, dim = 0)
-
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
-
-                        # whether to calculate fid
-
-                        if self.calculate_fid:
-                            fid_score = self.fid_scorer.fid_score()
-                            accelerator.print(f'fid_score: {fid_score}')
-
-                        if self.save_best_and_latest_only:
-                            if self.best_fid > fid_score:
-                                self.best_fid = fid_score
-                                self.save("best")
-                            self.save("latest")
-                        else:
-                            self.save(milestone)
+                        samples_fig=plt.figure(figsize=(18, 9))
+                        plt.suptitle("Conditions after %d epochs" % self.step)
+                        for pp in range(20):
+                            plt.subplot(4, 5, 1 + pp)
+                            plt.axis('off')
+                            plt.imshow(x_cond_rand[pp,0,:,:].squeeze().data.cpu().numpy(),
+                                        cmap='RdBu', vmin=0, vmax=1)
+                            plt.colorbar()
+                        plt.tight_layout()
+                        wandb.log({"Context":wandb.Image(samples_fig)})
+                        plt.close()
 
                 pbar.update(1)
 

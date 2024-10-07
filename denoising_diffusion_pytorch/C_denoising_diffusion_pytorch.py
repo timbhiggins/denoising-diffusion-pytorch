@@ -1296,7 +1296,7 @@ class Trainer:
                             self.save("latest")
                         else:
                             self.save(milestone, self.run_name)
-
+                
                 pbar.update(1)
 
         accelerator.print('training complete')

@@ -1,4 +1,7 @@
+import glob
 import torch
+import requests
+import random
 from denoising_diffusion_pytorch import Unet, GaussianDiffusion
 from denoising_diffusion_pytorch import Trainer
 import os
@@ -12,7 +15,6 @@ from torch.utils.data import DataLoader
 import math
 import copy
 from pathlib import Path
-from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
@@ -86,8 +88,9 @@ model = Unet(
     dim = 64,
     dim_mults = (1, 2, 4, 8),
     flash_attn = True,
-    self_condition = True
+    self_condition = False
 )
+
 
 diffusion = GaussianDiffusion(
     model,
@@ -97,21 +100,38 @@ diffusion = GaussianDiffusion(
     objective = "pred_v",
 )
 diffusion.is_ddim_sampling = True
+word_site = "https://www.mit.edu/~ecprice/wordlist.10000"
+response = requests.get(word_site)
+WORDS = response.content.splitlines()
 
+rn1 = random.randint(0, 10000)
+rn2 = random.randint(0, 10000)
+
+w1 = str(WORDS[rn1]).split('b')[1][1:-1]
+w2 = str(WORDS[rn2]).split('b')[1][1:-1]
+
+run_name = f'{w1}_{w2}'
+
+print(f'my name is {run_name}')
 trainer = Trainer(
     diffusion,
     '/glade/derecho/scratch/timothyh/data/diffusion_forecasts/processed/lead_0/',
+    run_name,
+    do_wandb = True,
     train_batch_size = 32,
     train_lr = 8e-5,
-    train_num_steps = 300,         # total training steps
+    train_num_steps = 20000,         # total training steps
     gradient_accumulate_every = 2,    # gradient accumulation steps
     ema_decay = 0.995,                # exponential moving average decay
     amp = True,                       # turn on mixed precision
     calculate_fid = False,           # whether to calculate fid during training
     max_grad_norm = 1.0,
 )
-ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
+models = sorted([I for I in glob.glob('/glade/work/timothyh/Diffusion/Forecasting/denoising-diffusion-pytorch/results/*.pt')])
+trainer.load(str(len(models)))
 
+ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
+#trainer.load('1')
 trainer.train()
 mean = 152.16729736328125
 std = 147.735107421875

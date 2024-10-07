@@ -1,0 +1,89 @@
+_wandb:
+    value:
+        cli_version: 0.18.1
+        m: []
+        python_version: 3.8.6
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 54
+                - 55
+                - 71
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 54
+                - 55
+                - 71
+            "3":
+                - 13
+                - 23
+                - 55
+                - 61
+            "4": 3.8.6
+            "5": 0.18.1
+            "6": 4.40.1
+            "8":
+                - 5
+            "12": 0.18.1
+            "13": linux-x86_64
+activation:
+    value: gelu
+base_dim:
+    value: 32
+context_channels:
+    value: 1
+context_image:
+    value: true
+denoise_time:
+    value: 970
+dim_mults:
+    value:
+        - 4
+        - 4
+hidden_channels:
+    value: 32
+hidden_context_channels:
+    value: 8
+image_size:
+    value: 128
+input_channels:
+    value: 1
+noise_sampling_coeff:
+    value: 0.85
+norm:
+    value: true
+num_blocks:
+    value:
+        - 2
+        - 2
+optimization:
+    value:
+        batch_size: 32
+        epochs: 400
+        lr: 0.01
+        scheduler: true
+        wd: 0.05
+output_channels:
+    value: 1
+pading:
+    value: reflect
+save_name:
+    value: model_weights.pt
+scaling:
+    value: std
+subsample:
+    value: 100000
+time_embedding_dim:
+    value: 256
+timesteps:
+    value: 1000
