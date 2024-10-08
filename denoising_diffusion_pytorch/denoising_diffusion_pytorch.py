@@ -1011,6 +1011,7 @@ class Trainer:
         self,
         diffusion_model,
         folder,
+        lead,
         run_name,
         do_wandb,
         *,
@@ -1082,8 +1083,10 @@ class Trainer:
 
         
         config = get_config()
-        FPs = sorted(glob.glob(f'{folder}*train.nc'))
-        self.ds = DataProcessed(FPs, config)
+        FPs1 = sorted(glob.glob(f'{folder}'+str(lead)+f'/*train.nc'))
+        FPs2 = sorted(glob.glob(f'{folder}'+str(lead-3)+f'/*train.nc'))
+        FPs3 = sorted(glob.glob(f'{folder}'+str(lead+3)+f'/*train.nc'))
+        self.ds = DataProcessed([FPs1[0],FPs2[0],FPs3[0]], config)
         print(self.ds)
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = False, pin_memory = True, num_workers = 10)
 

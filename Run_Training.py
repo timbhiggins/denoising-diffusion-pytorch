@@ -2,6 +2,7 @@ import glob
 import torch
 import requests
 import random
+import argparse
 from denoising_diffusion_pytorch import Unet, GaussianDiffusion
 from denoising_diffusion_pytorch import Trainer
 import os
@@ -52,6 +53,11 @@ if gpu_id >= 0:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 else:
     device = torch.device('cpu')
+parser = argparse.ArgumentParser()
+parser.add_argument('--lead_time', type=int, default=6, help = 'lead time for the forecasts')
+parser.add_argument('--dim_mults', type=tuple, default=(1,2,4,8), help = 'dim mults for UNet')
+
+args = parser.parse_args()
 
 config = {
         "input_channels": 1,
@@ -86,7 +92,7 @@ config = {
 model = Unet(
     channels = 1,
     dim = 64,
-    dim_mults = (1, 2, 4, 8),
+    dim_mults = args.dim_mults,
     flash_attn = True,
     self_condition = False
 )
@@ -115,8 +121,9 @@ run_name = f'{w1}_{w2}'
 print(f'my name is {run_name}')
 trainer = Trainer(
     diffusion,
-    '/glade/derecho/scratch/timothyh/data/diffusion_forecasts/processed/lead_0/',
-    run_name,
+    '/glade/derecho/scratch/timothyh/data/diffusion_forecasts/processed/lead_',
+    args.lead_time,
+    'Lead_'+str(args.lead_time),
     do_wandb = True,
     train_batch_size = 32,
     train_lr = 8e-5,

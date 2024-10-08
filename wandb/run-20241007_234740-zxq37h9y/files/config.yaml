@@ -1,0 +1,110 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    python_version: 3.11.9
+    cli_version: 0.16.5
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1728366460.0
+    t:
+      1:
+      - 1
+      - 5
+      - 41
+      - 49
+      - 53
+      - 55
+      - 71
+      2:
+      - 1
+      - 5
+      - 41
+      - 49
+      - 53
+      - 54
+      - 55
+      - 71
+      3:
+      - 13
+      - 23
+      - 61
+      4: 3.11.9
+      5: 0.16.5
+      8:
+      - 5
+      13: linux-x86_64
+input_channels:
+  desc: null
+  value: 1
+output_channels:
+  desc: null
+  value: 1
+context_image:
+  desc: null
+  value: true
+context_channels:
+  desc: null
+  value: 1
+num_blocks:
+  desc: null
+  value:
+  - 2
+  - 2
+hidden_channels:
+  desc: null
+  value: 32
+hidden_context_channels:
+  desc: null
+  value: 8
+time_embedding_dim:
+  desc: null
+  value: 256
+image_size:
+  desc: null
+  value: 128
+noise_sampling_coeff:
+  desc: null
+  value: 0.85
+denoise_time:
+  desc: null
+  value: 970
+activation:
+  desc: null
+  value: gelu
+norm:
+  desc: null
+  value: true
+subsample:
+  desc: null
+  value: 100000
+save_name:
+  desc: null
+  value: model_weights.pt
+dim_mults:
+  desc: null
+  value:
+  - 4
+  - 4
+base_dim:
+  desc: null
+  value: 32
+timesteps:
+  desc: null
+  value: 1000
+pading:
+  desc: null
+  value: reflect
+scaling:
+  desc: null
+  value: std
+optimization:
+  desc: null
+  value:
+    epochs: 400
+    lr: 0.01
+    wd: 0.05
+    batch_size: 32
+    scheduler: true
